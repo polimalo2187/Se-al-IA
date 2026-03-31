@@ -14,7 +14,7 @@ from app.plans import PLAN_FREE, PLAN_PLUS, PLAN_PREMIUM, activate_plus, activat
 from app.signals import get_latest_base_signal_for_plan, format_user_signal
 from app.config import is_admin, get_admin_whatsapps
 from app.menus import main_menu, back_to_menu
-from app.referrals import get_user_referral_stats, get_referral_link, register_valid_referral, check_ref_rewards
+from app.referrals import get_user_referral_stats, get_referral_link, check_ref_rewards
 
 try:
     from app.statistics import (
@@ -69,6 +69,33 @@ def _wa_link(phone: str, message: str) -> str:
     clean = "".join(ch for ch in phone_str if ch.isdigit())
     return f"https://wa.me/{clean}?text={quote(message)}"
 
+
+
+def _clear_admin_plan_flow(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Limpia estados transitorios del flujo admin de activación de planes."""
+    for key in (
+        "awaiting_user_id",
+        "awaiting_plan_choice",
+        "awaiting_custom_plan_days",
+        "target_user_id",
+        "pending_custom_plan",
+    ):
+        context.user_data.pop(key, None)
+
+
+def _clear_admin_delete_flow(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Limpia estados transitorios del flujo admin de eliminación de usuarios."""
+    context.user_data.pop("awaiting_delete_user_id", None)
+
+
+def _admin_plan_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟡 Activar PLUS · 30 días", callback_data="choose_plus_plan")],
+        [InlineKeyboardButton("🔴 Activar PREMIUM · 30 días", callback_data="choose_premium_plan")],
+        [InlineKeyboardButton("🟨 Activar PLUS · días personalizados", callback_data="choose_plus_custom")],
+        [InlineKeyboardButton("🟥 Activar PREMIUM · días personalizados", callback_data="choose_premium_custom")],
+        [InlineKeyboardButton("❌ Cancelar", callback_data="back_menu")],
+    ])
 
 def parse_ref_code(start_param: str) -> int | None:
     """Extrae user_id del referidor desde start parameter de Telegram"""
@@ -160,11 +187,15 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if action == "admin_delete_user" and admin:
+            _clear_admin_plan_flow(context)
+            _clear_admin_delete_flow(context)
             context.user_data["awaiting_delete_user_id"] = True
             await query.edit_message_text("🆔 Envía el User ID del usuario a eliminar:")
             return
 
         if action == "admin_activate_plan" and admin:
+            _clear_admin_delete_flow(context)
+            _clear_admin_plan_flow(context)
             context.user_data["awaiting_user_id"] = True
             await query.edit_message_text("🆔 Envía el User ID del usuario:")
             return
@@ -302,6 +333,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if action == "back_menu":
             context.user_data["watchlist_active"] = False
+            _clear_admin_plan_flow(context)
+            _clear_admin_delete_flow(context)
             await query.edit_message_text(
 "🏠 MENÚ PRINCIPAL — Selecciona una opción abajo",
                 reply_markup=main_menu(is_admin=admin),
@@ -310,29 +343,53 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if action in ["choose_plus_plan", "choose_premium_plan"]:
             target_user_id = context.user_data.get("target_user_id")
-            if target_user_id:
-                loop = asyncio.get_event_loop()
-                if action == "choose_plus_plan":
-                    success = await loop.run_in_executor(
-                        None,
-                        partial(activate_plus, target_user_id)
-                    )
-                    plan_name = "PLUS"
-                else:
-                    success = await loop.run_in_executor(
-                        None,
-                        partial(activate_premium, target_user_id)
-                    )
-                    plan_name = "PREMIUM"
+            if not target_user_id:
+                _clear_admin_plan_flow(context)
+                await query.edit_message_text("❌ El flujo de activación expiró. Vuelve a iniciar desde el panel admin.")
+                return
 
-                if success:
-                    register_valid_referral(target_user_id, plan_name)
-                    await query.edit_message_text(f"✅ Plan {plan_name} activado correctamente.")
-                else:
-                    await query.edit_message_text(f"❌ No se pudo activar el plan {plan_name}.")
+            loop = asyncio.get_event_loop()
+            duration_days = 30
 
-                context.user_data.pop("awaiting_plan_choice", None)
-                context.user_data.pop("target_user_id", None)
+            if action == "choose_plus_plan":
+                success = await loop.run_in_executor(
+                    None,
+                    partial(activate_plus, target_user_id, duration_days)
+                )
+                plan_name = "PLUS"
+            else:
+                success = await loop.run_in_executor(
+                    None,
+                    partial(activate_premium, target_user_id, duration_days)
+                )
+                plan_name = "PREMIUM"
+
+            if success:
+                await query.edit_message_text(
+                    f"✅ Plan {plan_name} activado correctamente por {duration_days} días para el usuario {target_user_id}."
+                )
+            else:
+                await query.edit_message_text(f"❌ No se pudo activar el plan {plan_name}.")
+
+            _clear_admin_plan_flow(context)
+            return
+
+        if action in ["choose_plus_custom", "choose_premium_custom"]:
+            target_user_id = context.user_data.get("target_user_id")
+            if not target_user_id:
+                _clear_admin_plan_flow(context)
+                await query.edit_message_text("❌ El flujo de activación expiró. Vuelve a iniciar desde el panel admin.")
+                return
+
+            context.user_data["awaiting_custom_plan_days"] = True
+            context.user_data["awaiting_plan_choice"] = False
+            context.user_data["pending_custom_plan"] = PLAN_PLUS if action == "choose_plus_custom" else PLAN_PREMIUM
+            plan_label = "PLUS" if action == "choose_plus_custom" else "PREMIUM"
+            await query.edit_message_text(
+                f"🗓 Envía la cantidad de días para activar {plan_label} al usuario {target_user_id}.\n"
+                "Acepta solo números enteros positivos (ej: 7, 15, 21, 30, 45).",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="back_menu")]]),
+            )
             return
 
     except Exception as e:
@@ -453,7 +510,11 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
         await handle_watchlist_text_input(update, context)
         return
 
-    if context.user_data.get("awaiting_user_id") or context.user_data.get("awaiting_delete_user_id"):
+    if (
+        context.user_data.get("awaiting_user_id")
+        or context.user_data.get("awaiting_delete_user_id")
+        or context.user_data.get("awaiting_custom_plan_days")
+    ):
         await handle_admin_text_input(update, context)
         return
     
@@ -1415,19 +1476,20 @@ async def handle_radar(query, user, plan: str):
         raise
 async def handle_admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        target_user_id_str = update.message.text.strip()
+        text_value = update.message.text.strip()
+
+        if not is_admin(update.effective_user.id):
+            _clear_admin_plan_flow(context)
+            _clear_admin_delete_flow(context)
+            await update.message.reply_text("❌ Permisos revocados.")
+            return
 
         if context.user_data.get("awaiting_delete_user_id"):
             try:
-                target_user_id = int(target_user_id_str)
+                target_user_id = int(text_value)
             except ValueError:
+                _clear_admin_delete_flow(context)
                 await update.message.reply_text("❌ ID inválido.")
-                context.user_data["awaiting_delete_user_id"] = False
-                return
-
-            if not is_admin(update.effective_user.id):
-                await update.message.reply_text("❌ Permisos revocados.")
-                context.user_data["awaiting_delete_user_id"] = False
                 return
 
             users_col = users_collection()
@@ -1438,55 +1500,111 @@ async def handle_admin_text_input(update: Update, context: ContextTypes.DEFAULT_
                 lambda: users_col.update_one({"user_id": target_user_id}, {"$set": {"banned": True}})
             )
 
-            context.user_data["awaiting_delete_user_id"] = False
+            _clear_admin_delete_flow(context)
             await update.message.reply_text("🚫 Usuario eliminado para siempre.")
             return
-        logger.info(f"[ADMIN] Recibido User ID: {target_user_id_str}")
-        
-        try:
-            target_user_id = int(target_user_id_str)
-        except ValueError:
-            await update.message.reply_text("❌ ID inválido. Debe ser un número.")
-            context.user_data["awaiting_user_id"] = False
+
+        if context.user_data.get("awaiting_custom_plan_days"):
+            target_user_id = context.user_data.get("target_user_id")
+            target_plan = context.user_data.get("pending_custom_plan")
+
+            if not target_user_id or target_plan not in {PLAN_PLUS, PLAN_PREMIUM}:
+                _clear_admin_plan_flow(context)
+                await update.message.reply_text("❌ El flujo de activación expiró. Vuelve a iniciarlo desde el panel admin.")
+                return
+
+            try:
+                custom_days = int(text_value)
+            except ValueError:
+                await update.message.reply_text("❌ Días inválidos. Envía un número entero positivo.")
+                return
+
+            if custom_days <= 0:
+                await update.message.reply_text("❌ Los días deben ser mayores que 0.")
+                return
+
+            if custom_days > 3650:
+                await update.message.reply_text("❌ El máximo permitido es 3650 días para evitar errores de carga manual.")
+                return
+
+            users_col = users_collection()
+            loop = asyncio.get_event_loop()
+            target_user = await loop.run_in_executor(
+                None,
+                lambda: users_col.find_one({"user_id": target_user_id})
+            )
+
+            if not target_user:
+                _clear_admin_plan_flow(context)
+                await update.message.reply_text("❌ Usuario no encontrado en la base de datos.")
+                return
+
+            if target_plan == PLAN_PLUS:
+                success = await loop.run_in_executor(
+                    None,
+                    partial(activate_plus, target_user_id, custom_days)
+                )
+                plan_label = "PLUS"
+            else:
+                success = await loop.run_in_executor(
+                    None,
+                    partial(activate_premium, target_user_id, custom_days)
+                )
+                plan_label = "PREMIUM"
+
+            if success:
+                await update.message.reply_text(
+                    f"✅ Plan {plan_label} activado correctamente por {custom_days} días para el usuario {target_user_id}."
+                )
+            else:
+                await update.message.reply_text(f"❌ No se pudo activar el plan {plan_label}.")
+
+            _clear_admin_plan_flow(context)
             return
 
-        if not is_admin(update.effective_user.id):
-            await update.message.reply_text("❌ Permisos revocados.")
-            context.user_data["awaiting_user_id"] = False
+        logger.info(f"[ADMIN] Recibido User ID: {text_value}")
+
+        try:
+            target_user_id = int(text_value)
+        except ValueError:
+            _clear_admin_plan_flow(context)
+            await update.message.reply_text("❌ ID inválido. Debe ser un número.")
             return
 
         users_col = users_collection()
         loop = asyncio.get_event_loop()
-        
+
         target_user = await loop.run_in_executor(
             None,
             lambda: users_col.find_one({"user_id": target_user_id})
         )
-        
+
         if not target_user:
+            _clear_admin_plan_flow(context)
             await update.message.reply_text("❌ Usuario no encontrado en la base de datos.")
-            context.user_data["awaiting_user_id"] = False
             return
 
         context.user_data["awaiting_user_id"] = False
         context.user_data["awaiting_plan_choice"] = True
+        context.user_data["awaiting_custom_plan_days"] = False
         context.user_data["target_user_id"] = target_user_id
+        context.user_data.pop("pending_custom_plan", None)
 
-        keyboard = [
-            [InlineKeyboardButton("🟡 Activar PLAN PLUS", callback_data="choose_plus_plan")],
-            [InlineKeyboardButton("🔴 Activar PLAN PREMIUM", callback_data="choose_premium_plan")],
-            [InlineKeyboardButton("❌ Cancelar", callback_data="back_menu")]
-        ]
-
+        current_plan = str(target_user.get("plan") or PLAN_FREE).upper()
         await update.message.reply_text(
-            f"✅ Usuario encontrado: {target_user_id}\nSeleccione el plan a activar:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            (
+                f"✅ Usuario encontrado: {target_user_id}\n"
+                f"Plan actual: {current_plan}\n\n"
+                "Selecciona cómo quieres activar el plan:"
+            ),
+            reply_markup=_admin_plan_keyboard(),
         )
 
     except Exception as e:
         logger.error(f"[ADMIN] Error en handle_admin_text: {e}", exc_info=True)
+        _clear_admin_plan_flow(context)
+        _clear_admin_delete_flow(context)
         await update.message.reply_text("❌ Error procesando la solicitud.")
-        context.user_data["awaiting_user_id"] = False
 
 # ======================================================
 # REGISTRO DE HANDLERS
@@ -1496,7 +1614,7 @@ def get_handlers():
     return [
         CallbackQueryHandler(
             handle_menu,
-            pattern="^(view_signals|radar|radar_refresh|performance|reset_stats|movers|market|market_refresh|watchlist|wl_refresh|wl_clear|wl_rm:[A-Z0-9]+|alerts|alerts_refresh|history|history_refresh|plans|my_account|referrals|support|admin_panel|admin_activate_plan|admin_delete_user|back_menu|choose_plus_plan|choose_premium_plan|register_exchange)$"
+            pattern="^(view_signals|radar|radar_refresh|performance|reset_stats|movers|market|market_refresh|watchlist|wl_refresh|wl_clear|wl_rm:[A-Z0-9]+|alerts|alerts_refresh|history|history_refresh|plans|my_account|referrals|support|admin_panel|admin_activate_plan|admin_delete_user|back_menu|choose_plus_plan|choose_premium_plan|choose_plus_custom|choose_premium_custom|register_exchange)$"
         ),
         CallbackQueryHandler(handle_copy_ref_code, pattern="^copy_ref_code$"),
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages),
